@@ -1,0 +1,20 @@
+[tool.ruff]
+line-length = 100
+target-version = "py38"
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # Pyflakes
+    "I",    # isort
+    "N",    # pep8-naming
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",  # line-too-long (we handle this with line-length)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["astrbot"]
+known-third-party = ["discord", "aiohttp"]

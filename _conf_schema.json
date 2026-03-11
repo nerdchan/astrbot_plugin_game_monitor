@@ -1,0 +1,33 @@
+{
+  "discord_bot_token": {
+    "type": "string",
+    "description": "Discord Bot Token（可選）",
+    "hint": "若為空，則使用 AstrBot Agent的 Bot Token 進行監控。若指定自訂 Token，該 Bot 需要具有目標伺服器的成員及 Presence Intent 權限。",
+    "obvious_hint": false,
+    "default": ""
+  },
+  "target_guild_id": {
+    "type": "string",
+    "description": "目標伺服器 ID (Guild ID)",
+    "hint": "目標使用者所在的 Discord 伺服器 ID。Presence 資訊必須在 Guild 上下文中才能被完整讀取。",
+    "default": ""
+  },
+  "target_discord_id": {
+    "type": "string",
+    "description": "目標使用者 Discord ID",
+    "hint": "要監控的目標使用者的 Discord 使用者 ID。",
+    "default": ""
+  },
+  "target_channel_id": {
+    "type": "string",
+    "description": "關心訊息發送頻道 ID（可選）",
+    "hint": "若配置，隨機觸發的 LLM 關心訊息會主動送到此 Discord 頻道。可填純數字或 <#channel_id>。",
+    "default": ""
+  },
+  "use_web_search": {
+    "type": "bool",
+    "description": "啟用網路搜尋補充遊戲信息",
+    "hint": "若啟用，插件會在 Prompt 中明確要求 LLM 搜索該遊戲的特色。需要在 AstrBot WebUI 的提供商設定中也啟用 web_search。",
+    "default": false
+  }
+}
