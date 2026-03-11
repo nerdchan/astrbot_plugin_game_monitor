@@ -23,8 +23,8 @@
 ```bash
 # 克隆到 AstrBot 的插件目錄
 cd AstrBot/data/plugins
-git clone https://github.com/<your-account>/astrbot-plugin-discord-game-monitor.git
-cd astrbot-plugin-discord-game-monitor
+git clone https://github.com/nerdchan/astrbot_plugin_game_monitor.git
+cd astrbot_plugin_game_monitor
 
 # 安裝依賴
 pip install -r requirements.txt
@@ -43,6 +43,34 @@ pip install -r requirements.txt
 | **目標使用者 ID** | 要監控的用戶的 Discord ID | `[target_discord_id]` |
 | **關心訊息發送頻道 ID（可選）** | 自動觸發關心時主動發送到指定頻道 | `[target_channel_id]` |
 | **啟用網路搜尋提示** | 若啟用，LLM 可利用網路搜尋補充遊戲資訊 | `false` |
+| **聯動策略模式** | `auto/fallback/strict`，控制指定來源失敗時是否回退 | `auto` |
+| **人格來源** | `current_persona/soul_file/external_persona_plugin/custom_prompt_profile` | `current_persona` |
+| **人格插件名稱（可選）** | 當人格來源為外部插件時填寫插件名稱 | `` |
+| **搜尋來源** | `auto/astrbot_native_tools/external_search_plugin/agent_skill/mixed` | `auto` |
+| **搜尋插件或 Skill 名稱（可選）** | 當搜尋來源為外部插件或 Skill 時填寫名稱 | `` |
+| **搜尋語氣偏好** | `formal/community/hybrid` | `hybrid` |
+| **主動訊息投遞模式** | `auto/channel_push/reply_only/both` | `auto` |
+
+#### 🔗 聯動策略建議（可自行選插件）
+
+若你希望和 SOUL.md、外部人格插件、或其他網搜插件聯動，建議這樣設定：
+
+1. **最穩定（推薦）**
+   - `linkage_mode=auto`
+   - `persona_source=current_persona` 或 `soul_file`
+   - `search_source=astrbot_native_tools`（或 `auto`）
+   - 適合先追求穩定輸出，避免觸發流程中斷。
+
+2. **嘗試外部插件 + 自動回退**
+   - `linkage_mode=fallback`
+   - `persona_source=external_persona_plugin` + 填 `persona_plugin_name`
+   - `search_source=external_search_plugin` 或 `agent_skill` + 填 `search_plugin_name`
+   - 目前外部插件採「提示級聯動」，若不可用會回退到內建可用路徑。
+
+3. **嚴格模式（只走你指定的來源）**
+   - `linkage_mode=strict`
+   - 僅在你已確認外部插件具備可調用能力時使用。
+   - 若指定來源不可用，插件會中止該次觸發，不會自動回退。
 
 #### 🔍 如何獲取這些值？
 
@@ -203,6 +231,7 @@ logger.warning("[GameMonitor] Discord Bot Token 未配置，部分功能將不�
 
 1. 當人格（Persona）由其他插件接管或保管時，本插件的認知提示與回覆語氣可能無法完整聯動。
 2. 目前預設網搜來源偏向 Google/Bing 類結果，評論語氣較正式；若能補充 bilibili / X(Twitter) / Steam 的玩家評論來源，遊戲關心內容會更接地氣。
+3. 外部人格插件 / 外部搜尋插件 / Agent Skill 目前屬於可配置入口，預設為提示級聯動；完整跨插件橋接將在後續版本補齊。
 
 4. **零硬編碼承諾**
    - 代碼中沒有任何特定的 User ID、Guild ID 或角色名稱寫死
@@ -302,8 +331,8 @@ prompt_variants = [
 
 ```bash
 cd AstrBot/data/plugins
-git clone https://github.com/<your-account>/astrbot-plugin-discord-game-monitor.git
-cd astrbot-plugin-discord-game-monitor
+git clone https://github.com/nerdchan/astrbot_plugin_game_monitor.git
+cd astrbot_plugin_game_monitor
 pip install -r requirements.txt
 ```
 
