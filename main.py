@@ -39,9 +39,9 @@ logger = logging.getLogger(__name__)
 
 
 @register(
-    name="astrbot_plugin_discord_game_monitor",
-    author="AstrBot Community",
-    desc="事件驅動 + 認知建立 + Tool Calling 整合。監聽 Presence → 25% 隨機觸發檢測遊戲 → 120 分鐘超時強制提醒",
+    name="astrbot_plugin_game_monitor",
+    author="Melantilla.",
+    desc="主動監控 Discord 使用者的實時遊戲狀態，並透過人格生成符合人設的互動回覆。",
     version="0.3.1"
 )
 class GameMonitorPlugin(Star):
@@ -74,6 +74,34 @@ class GameMonitorPlugin(Star):
         self.target_discord_id = self.config.get("target_discord_id", "")
         self.target_channel_id = self.config.get("target_channel_id", "")
         self.use_web_search = self.config.get("use_web_search", False)
+        self.linkage_mode = self._normalize_choice(
+            self.config.get("linkage_mode", "auto"),
+            {"auto", "fallback", "strict"},
+            "auto",
+        )
+        self.persona_source = self._normalize_choice(
+            self.config.get("persona_source", "current_persona"),
+            {"current_persona", "soul_file", "external_persona_plugin", "custom_prompt_profile"},
+            "current_persona",
+        )
+        self.persona_plugin_name = str(self.config.get("persona_plugin_name", "") or "").strip()
+        self.search_source = self._normalize_choice(
+            self.config.get("search_source", "auto"),
+            {"auto", "astrbot_native_tools", "external_search_plugin", "agent_skill", "mixed"},
+            "auto",
+        )
+        self.search_plugin_name = str(self.config.get("search_plugin_name", "") or "").strip()
+        self.search_tool_preferences = self._parse_name_list(self.search_plugin_name)
+        self.search_style = self._normalize_choice(
+            self.config.get("search_style", "hybrid"),
+            {"formal", "community", "hybrid"},
+            "hybrid",
+        )
+        self.delivery_mode = self._normalize_choice(
+            self.config.get("delivery_mode", "auto"),
+            {"auto", "channel_push", "reply_only", "both"},
+            "auto",
+        )
         
         # 後台 Discord Bot
         self.discord_bot = None
@@ -94,6 +122,21 @@ class GameMonitorPlugin(Star):
             logger.warning("[GameMonitor] Discord Bot Token 未配置，事件監聽功能將不可用。")
         if not self.target_guild_id or not self.target_discord_id:
             logger.warning("[GameMonitor] 目標 Guild ID 或 User ID 未配置。")
+
+    def _normalize_choice(self, raw_value, allowed_values, default_value: str) -> str:
+        """Normalize a config enum-like value to avoid invalid branch behavior."""
+        value = str(raw_value or "").strip().lower()
+        if value in allowed_values:
+            return value
+        return default_value
+
+    def _parse_name_list(self, raw_value: str) -> list[str]:
+        """Parse comma/newline separated config names into a compact list."""
+        if not raw_value:
+            return []
+
+        parts = re.split(r"[,\n]+", str(raw_value))
+        return [part.strip() for part in parts if part.strip()]
 
     def _get_state_file_path(self) -> str:
         """取得 state.json 的絕對路徑"""
@@ -772,7 +815,7 @@ class GameMonitorPlugin(Star):
                 if random.random() < 0.25 and game_name not in self._recognition_triggered_today:
                     logger.info(f"[GameMonitor] 🎲 觸發 25% 隨機認知建立: {game_name}")
                     llm_text = await self._trigger_llm_recognition(game_name)
-                    if llm_text:
+                    if llm_text and self._should_send_proactive_from_presence():
                         await self._send_proactive_message(llm_text)
                     self._recognition_triggered_today.add(game_name)
             else:
@@ -822,20 +865,12 @@ class GameMonitorPlugin(Star):
         2. 再以 Persona 語氣進行回應
         """
         try:
-            # 構造系統指令（Prompt Engineers 的魔法）
-            system_instruction = f"""【系統指令】：User 剛剛開啟了一款名為『{game_name}』的遊戲。
+            strict_reason = self._get_strict_block_reason(event)
+            if strict_reason:
+                logger.warning(f"[GameMonitor] strict 模式阻擋觸發: {strict_reason}")
+                return None
 
-請你執行以下步驟：
-
-1️⃣ 先使用你的『聯網搜尋技能』，查閱這是一款什麼類型、什麼風格的遊戲。例如：FPS、休閒、恐怖、RPG、或是成人遊戲？
-
-2️⃣ 了解遊戲背景後，以你的 Persona 語氣，結合你查到的遊戲特色，對 User 說一句簡短的關心或調侃。
-
-💡 提示：
-- 如果查到類似黃遊或奇怪的遊戲，請盡情吐槽或吃醋
-- 如果是《Valorant》或《Helldivers》這類射擊/硬核遊戲，可以傲嬌地要 User 注意安全或早點打完陪妳
-- 如果是休閒遊戲，可以溫柔地表示支持
-- 保持簡潔，一句話即可"""
+            system_instruction = self._build_recognition_prompt(game_name)
             
             provider_id = ""
             if event is not None:
@@ -856,28 +891,41 @@ class GameMonitorPlugin(Star):
                 return None
 
             prompt = system_instruction
-            if self.use_web_search:
-                prompt += (
-                    "\n\n你可以使用 AstrBot 的工具呼叫能力。"
-                    "若可用，請實際呼叫網路搜尋工具，再輸出最終一句話。"
-                    "不要在最終回答中輸出 <tool_code> 或工具指令標記。"
-                )
+            execution_mode, reason = self._decide_search_execution_mode(event)
+            logger.info(
+                f"[GameMonitor] 認知觸發策略: linkage_mode={self.linkage_mode}, "
+                f"persona_source={self.persona_source}, search_source={self.search_source}, "
+                f"execution_mode={execution_mode}, reason={reason}"
+            )
 
-            if self.use_web_search and event is not None:
+            if execution_mode == "tool_loop":
                 active_tools = self._get_active_global_tools()
-                llm_resp = await self.context.tool_loop_agent(
-                    event=event,
-                    chat_provider_id=provider_id,
-                    prompt=prompt,
-                    tools=active_tools,
-                    max_steps=8,
-                    tool_call_timeout=60,
-                )
-            else:
-                if self.use_web_search and event is None:
-                    logger.info(
-                        "[GameMonitor] 自動觸發無事件上下文，無法啟用 tool_loop_agent；改用 llm_generate。"
+                selected_tools, tool_reason = self._select_tools_for_search(active_tools)
+                if selected_tools.empty():
+                    logger.warning(
+                        f"[GameMonitor] 找不到可用搜尋工具，停止 tool_loop。reason={tool_reason}"
                     )
+                    if self.linkage_mode == "strict":
+                        return None
+                    llm_resp = await self.context.llm_generate(
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                    )
+                else:
+                    logger.info(
+                        "[GameMonitor] 搜尋工具選擇: %s | reason=%s",
+                        [tool.name for tool in getattr(selected_tools, "tools", [])],
+                        tool_reason,
+                    )
+                    llm_resp = await self.context.tool_loop_agent(
+                        event=event,
+                        chat_provider_id=provider_id,
+                        prompt=prompt,
+                        tools=selected_tools,
+                        max_steps=8,
+                        tool_call_timeout=60,
+                    )
+            else:
                 llm_resp = await self.context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=prompt,
@@ -896,6 +944,122 @@ class GameMonitorPlugin(Star):
             logger.error(f"[GameMonitor] 認知建立觸發失敗: {str(e)}")
             return None
 
+    def _build_recognition_prompt(self, game_name: str) -> str:
+        """Assemble prompt with selectable persona/search directives."""
+        persona_hint = self._build_persona_hint()
+        style_hint = {
+            "formal": "輸出偏正式且資訊密度高。",
+            "community": "輸出採玩家社群口吻，接地氣、可輕鬆吐槽。",
+            "hybrid": "先保留重點事實，再改寫成玩家社群口吻。",
+        }.get(self.search_style, "先保留重點事實，再改寫成玩家社群口吻。")
+
+        search_hint = ""
+        if self.use_web_search:
+            preferred_hint = self._build_search_tool_hint()
+            search_hint = (
+                "\n3️⃣ 盡量先取得遊戲背景資訊後再回覆。"
+                "若可以呼叫工具，請優先使用可用搜尋能力。"
+                f"{preferred_hint}"
+                "不要在最終回答中輸出 <tool_code> 或工具指令標記。"
+            )
+
+        return f"""【系統指令】：User 剛剛開啟了一款名為『{game_name}』的遊戲。
+
+請你執行以下步驟：
+
+1️⃣ 先理解這款遊戲大致類型與特色（例如 FPS、RPG、休閒、恐怖等）。
+
+2️⃣ 以你的 Persona 語氣，對 User 說一句簡短的關心或調侃。
+
+{persona_hint}
+
+語氣要求：{style_hint}
+{search_hint}
+
+保持簡潔，一句話即可。"""
+
+    def _build_persona_hint(self) -> str:
+        """Return persona-source specific prompt guidance."""
+        if self.persona_source == "soul_file":
+            return "人格來源偏好：若你的執行環境有 SOUL.md 規格，請優先遵循其語氣與人設。"
+
+        if self.persona_source == "external_persona_plugin":
+            if self.persona_plugin_name:
+                return (
+                    f"人格來源偏好：優先參考外部人格插件「{self.persona_plugin_name}」的語氣設定。"
+                    "若無法取得其上下文，請維持目前可用 Persona。"
+                )
+            return "人格來源偏好：優先參考外部人格插件；若無法取得其上下文，請維持目前可用 Persona。"
+
+        if self.persona_source == "custom_prompt_profile":
+            return "人格來源偏好：優先維持當前對話中已建立的角色風格與口頭禪。"
+
+        return "人格來源偏好：使用目前會話 Persona。"
+
+    def _build_search_tool_hint(self) -> str:
+        """Add explicit tool preference to the prompt when configured."""
+        if not self.search_tool_preferences:
+            return ""
+
+        joined = ", ".join(self.search_tool_preferences)
+        return f"若這些工具可用，請優先使用：{joined}。"
+
+    def _get_strict_block_reason(self, event: Optional[AstrMessageEvent]) -> Optional[str]:
+        """Return reason when strict mode cannot satisfy selected linkage sources."""
+        if self.linkage_mode != "strict":
+            return None
+
+        if self.persona_source == "external_persona_plugin":
+            return "external_persona_plugin 目前僅提供提示級聯動，尚未實作通用跨插件人格橋接。"
+
+        if self.use_web_search and event is None and self.search_source in {
+            "astrbot_native_tools",
+            "mixed",
+            "external_search_plugin",
+            "agent_skill",
+            "auto",
+        }:
+            return "目前無事件上下文，無法使用 tool_loop_agent。"
+
+        return None
+
+    def _decide_search_execution_mode(self, event: Optional[AstrMessageEvent]) -> tuple[str, str]:
+        """Choose tool_loop_agent or llm_generate based on linkage config and runtime context."""
+        if not self.use_web_search:
+            return "llm_generate", "use_web_search=false"
+
+        if self.search_source in {"external_search_plugin", "agent_skill"}:
+            if event is not None:
+                reason = (
+                    f"search_source={self.search_source} 已配置"
+                    f"({self.search_plugin_name or '未填名稱'})，啟用指定工具篩選"
+                )
+                return "tool_loop", reason
+            reason = (
+                f"search_source={self.search_source} 已配置"
+                f"({self.search_plugin_name or '未填名稱'})，但缺少事件上下文"
+            )
+            return "llm_generate", reason
+
+        if self.search_source == "mixed":
+            if event is not None:
+                return "tool_loop", "mixed 模式命中原生工具路徑"
+            return "llm_generate", "mixed 模式缺少事件上下文，回退 llm_generate"
+
+        if self.search_source in {"astrbot_native_tools", "auto"}:
+            if event is not None:
+                return "tool_loop", "事件上下文可用，啟用原生工具鏈"
+            return "llm_generate", "無事件上下文，回退 llm_generate"
+
+        return "llm_generate", "未命中可用工具策略，回退 llm_generate"
+
+    def _should_send_proactive_from_presence(self) -> bool:
+        """Whether auto recognition from presence should push message to a channel."""
+        if self.delivery_mode == "reply_only":
+            logger.info("[GameMonitor] delivery_mode=reply_only，Presence 自動觸發不主動推送。")
+            return False
+        return True
+
     def _get_active_global_tools(self) -> ToolSet:
         """取得目前啟用中的全域工具集合。"""
         try:
@@ -909,6 +1073,56 @@ class GameMonitorPlugin(Star):
         except Exception as e:
             logger.warning(f"[GameMonitor] 取得全域工具集失敗: {str(e)}")
             return ToolSet()
+
+    def _select_tools_for_search(self, active_tools: ToolSet) -> tuple[ToolSet, str]:
+        """Filter tools so tool_loop_agent actually uses the configured search plugin/tool."""
+        tools = getattr(active_tools, "tools", [])
+        if not tools:
+            return ToolSet(), "no_active_tools"
+
+        preferred_names = self.search_tool_preferences[:]
+        if self.search_source == "astrbot_native_tools" and not preferred_names:
+            preferred_names = [
+                "web_search",
+                "fetch_url",
+                "web_search_tavily",
+                "tavily_extract_web_page",
+                "web_search_bocha",
+            ]
+
+        if not preferred_names:
+            return active_tools, "no_preference_configured"
+
+        selected = ToolSet()
+        matched_names = []
+        for tool in tools:
+            if any(self._tool_matches_preference(tool.name, pref) for pref in preferred_names):
+                selected.add_tool(tool)
+                matched_names.append(tool.name)
+
+        if matched_names:
+            return selected, f"matched_preference={matched_names}"
+
+        if self.linkage_mode == "strict":
+            return ToolSet(), f"preferred_tools_not_found={preferred_names}"
+
+        return active_tools, f"preferred_tools_not_found={preferred_names}, fallback_to_active_tools"
+
+    def _tool_matches_preference(self, tool_name: str, preference: str) -> bool:
+        """Loose match so config can use exact tool names, aliases, or short names."""
+        normalized_tool = self._normalize_identifier(tool_name)
+        normalized_pref = self._normalize_identifier(preference)
+        if not normalized_tool or not normalized_pref:
+            return False
+        return (
+            normalized_tool == normalized_pref
+            or normalized_pref in normalized_tool
+            or normalized_tool in normalized_pref
+        )
+
+    def _normalize_identifier(self, value: str) -> str:
+        """Normalize identifiers for fuzzy matching between plugin names and tool names."""
+        return re.sub(r"[^a-z0-9]+", "", str(value or "").lower())
 
     def _strip_tool_artifacts(self, text: str) -> str:
         """移除模型輸出的工具標記片段，避免回傳偽工具指令給用戶。"""
@@ -924,6 +1138,9 @@ class GameMonitorPlugin(Star):
         """將主動關心訊息送到指定 Discord 頻道。"""
         channel_id = self._parse_discord_id(self.target_channel_id)
         if channel_id is None:
+            if self.delivery_mode == "channel_push":
+                logger.warning("[GameMonitor] delivery_mode=channel_push，但 target_channel_id 未配置。")
+                return
             logger.info("[GameMonitor] 未配置 target_channel_id，略過主動發送關心訊息")
             return
 

@@ -15,14 +15,14 @@ git commit -m "release: game_monitor v0.3.1"
 
 Create a new empty repository on GitHub, for example:
 
-- Repository name: astrbot-plugin-discord-game-monitor
+- Repository name: astrbot_plugin_game_monitor
 - Visibility: Public
 - Do not add README/.gitignore/license (already exists locally)
 
 ## 3) Connect remote and push
 
 ```bash
-git remote add origin https://github.com/<your-account>/astrbot-plugin-discord-game-monitor.git
+git remote add origin https://github.com/nerdchan/astrbot_plugin_game_monitor.git
 git push -u origin main
 ```
 
@@ -35,7 +35,7 @@ git push origin v0.3.1
 
 ## Notes
 
-- Replace <your-account> in metadata.yaml and README.md before pushing.
+- Ensure metadata.yaml `name`/`desc`/`repo` exactly match your marketplace submission JSON.
 - Runtime files are ignored:
   - data/state.json
   - data/temp/

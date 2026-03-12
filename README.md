@@ -1,6 +1,6 @@
 # AstrBot Discord Game Monitor Plugin
 
-🎮 **主動監控 Discord 使用者的實時遊戲狀態，透過 AI Persona 生成符合人設的互動回覆。**
+🎮 **主動監控 Discord 使用者的實時遊戲狀態，並透過人格生成符合人設的互動回覆。**
 
 [English](#english) | [繁體中文](#繁體中文)
 

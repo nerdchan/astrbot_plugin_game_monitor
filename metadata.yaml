@@ -1,9 +1,9 @@
-name: astrbot_plugin_discord_game_monitor
+name: astrbot_plugin_game_monitor
 display_name: Discord 遊戲狀態監控
-desc: 主動監控 Discord 使用者的實時遊戲狀態，並透過 AI Persona 生成符合人設的互動回覆。
+desc: 主動監控 Discord 使用者的實時遊戲狀態，並透過人格生成符合人設的互動回覆。
 version: 0.3.1
 author: Melantilla.
-repo: "https://github.com/nerdchan/astrbot_plugin_game_monitor.git"
+repo: "https://github.com/nerdchan/astrbot_plugin_game_monitor"
 support_platforms:
   - discord
 astrbot_version: ">=4.16,<5"
