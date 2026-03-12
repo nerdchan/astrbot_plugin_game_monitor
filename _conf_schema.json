@@ -29,5 +29,47 @@
     "description": "啟用網路搜尋補充遊戲信息",
     "hint": "若啟用，插件會在 Prompt 中明確要求 LLM 搜索該遊戲的特色。需要在 AstrBot WebUI 的提供商設定中也啟用 web_search。",
     "default": false
+  },
+  "linkage_mode": {
+    "type": "string",
+    "description": "聯動策略模式",
+    "hint": "auto=自動判斷並回退、fallback=優先指定來源失敗回退、strict=只使用指定來源不回退。",
+    "default": "auto"
+  },
+  "persona_source": {
+    "type": "string",
+    "description": "人格來源",
+    "hint": "current_persona=目前會話人格、soul_file=偏好 SOUL.md 類人格來源、external_persona_plugin=指定其他人格插件、custom_prompt_profile=沿用當前對話已建立的人設語氣。",
+    "default": "current_persona"
+  },
+  "persona_plugin_name": {
+    "type": "string",
+    "description": "人格插件名稱（可選）",
+    "hint": "當 persona_source=external_persona_plugin 時填寫插件名稱；若不可用則依 linkage_mode 決定是否回退。",
+    "default": ""
+  },
+  "search_source": {
+    "type": "string",
+    "description": "搜尋來源",
+    "hint": "astrbot_native_tools=原生工具鏈、external_search_plugin=外部搜尋插件、agent_skill=Agent Skill、mixed=外部優先失敗回退、auto=自動。",
+    "default": "auto"
+  },
+  "search_plugin_name": {
+    "type": "string",
+    "description": "搜尋插件或 Skill 名稱（可選）",
+    "hint": "填寫實際工具名、別名或逗號分隔多個名稱，例如 web_search_tavily、tavily、web_search_bocha。未命中時會依 linkage_mode 決定是否回退。",
+    "default": ""
+  },
+  "search_style": {
+    "type": "string",
+    "description": "搜尋語氣偏好",
+    "hint": "formal=正式摘要、community=玩家社群口吻、hybrid=兩者混合。",
+    "default": "hybrid"
+  },
+  "delivery_mode": {
+    "type": "string",
+    "description": "主動訊息投遞模式",
+    "hint": "auto=有頻道就推送否則略過、channel_push=強制推送頻道、reply_only=只回指令事件、both=事件回覆+頻道推送。",
+    "default": "auto"
   }
 }

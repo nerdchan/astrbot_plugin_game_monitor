@@ -18,24 +18,29 @@ Author: AstrBot Community
 Version: 0.3.1
 """
 
-import logging
-import json
 import asyncio
+import json
 import os
 import random
 import re
+import threading
+from datetime import date as date_type
+from datetime import datetime
+from pathlib import Path
 from typing import Optional
-from datetime import datetime, timedelta, date as date_type
 
 import discord
 from discord.ext import tasks
+
+from astrbot.api import AstrBotConfig, logger
+from astrbot.api.event import AstrMessageEvent, filter
+from astrbot.api.star import Context, Star, register
 from astrbot.core.agent.tool import ToolSet
 
-from astrbot.api.event import filter, AstrMessageEvent, MessageEventResult
-from astrbot.api.star import Context, Star, register
-from astrbot.api import logger as astr_logger, AstrBotConfig
-
-logger = logging.getLogger(__name__)
+try:
+    from astrbot.api.star import StarTools
+except Exception:
+    StarTools = None
 
 
 @register(
@@ -47,14 +52,14 @@ logger = logging.getLogger(__name__)
 class GameMonitorPlugin(Star):
     """
     Discord 遊戲監控插件 - 完整架構
-    
+
     事件流：
     ┌─ on_presence_update (Discord Gateway 推送，無延遲)
     │  ├─ 記錄 game_start_time, current_game
     │  └─ 25% 概率 → 呼叫 _trigger_llm_recognition() (帶 Tool Calling)
     │
     ├─ Background tasks.loop (每 10 分鐘執行)
-    │  ├─ 計算 game_duration_minutes  
+    │  ├─ 計算 game_duration_minutes
     │  ├─ 若 >= 120 分鐘 && warned_today == False
     │  └─ → 呼叫 _trigger_llm_timeout_warning()
     │
@@ -66,10 +71,11 @@ class GameMonitorPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
         self.config = config
+        self._state_file_lock = threading.RLock()
         self.state_file = self._get_state_file_path()
-        
+
         # 配置參數
-        self.discord_bot_token = self.config.get("discord_bot_token", "")
+        self.discord_bot_token = str(self.config.get("discord_bot_token", "") or "").strip()
         self.target_guild_id = self.config.get("target_guild_id", "")
         self.target_discord_id = self.config.get("target_discord_id", "")
         self.target_channel_id = self.config.get("target_channel_id", "")
@@ -102,7 +108,7 @@ class GameMonitorPlugin(Star):
             {"auto", "channel_push", "reply_only", "both"},
             "auto",
         )
-        
+
         # 後台 Discord Bot
         self.discord_bot = None
         self.discord_client = None
@@ -110,14 +116,16 @@ class GameMonitorPlugin(Star):
         self._background_check_task = None
         self._presence_poll_task = None
         self._presence_listener_registered = False
-        
+
         # Tool Calling 狀態
+        self._recognition_trigger_date = date_type.today().isoformat()
         self._recognition_triggered_today = set()  # 記錄今天已觸發識別的遊戲名
-        
+        self.discord_bot_token = self._resolve_discord_token()
+
         logger.info(
             f"[GameMonitor] 插件初始化。狀態文件: {self.state_file}"
         )
-        
+
         if not self.discord_bot_token:
             logger.warning("[GameMonitor] Discord Bot Token 未配置，事件監聽功能將不可用。")
         if not self.target_guild_id or not self.target_discord_id:
@@ -140,8 +148,26 @@ class GameMonitorPlugin(Star):
 
     def _get_state_file_path(self) -> str:
         """取得 state.json 的絕對路徑"""
+        if StarTools is not None and hasattr(StarTools, "get_data_dir"):
+            try:
+                data_dir = StarTools.get_data_dir()
+                if data_dir:
+                    return str(Path(data_dir) / "state.json")
+            except Exception as e:
+                logger.warning(f"[GameMonitor] StarTools.get_data_dir() 取得失敗，改用插件目錄回退: {e}")
+
         plugin_dir = os.path.dirname(os.path.abspath(__file__))
         return os.path.join(plugin_dir, "data", "state.json")
+
+    def _reset_daily_runtime_flags_if_needed(self):
+        """Reset in-memory daily flags when date changes."""
+        today = date_type.today().isoformat()
+        if self._recognition_trigger_date == today:
+            return
+
+        self._recognition_trigger_date = today
+        self._recognition_triggered_today.clear()
+        logger.info("[GameMonitor] 跨日重置 recognition 觸發集合")
 
     def _default_state(self) -> dict:
         """state.json 的預設結構，確保事件欄位不缺失"""
@@ -228,9 +254,12 @@ class GameMonitorPlugin(Star):
 
     def _persist_state(self, state: dict):
         """寫入插件狀態文件"""
-        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-        with open(self.state_file, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
+        with self._state_file_lock:
+            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+            temp_file = f"{self.state_file}.tmp"
+            with open(temp_file, "w", encoding="utf-8") as f:
+                json.dump(state, f, ensure_ascii=False, indent=2)
+            os.replace(temp_file, self.state_file)
 
     def _get_astrbot_discord_client(self):
         """從 AstrBot 上下文獲取已存在的 Discord client。"""
@@ -352,24 +381,24 @@ class GameMonitorPlugin(Star):
         """被動查詢指令 - 讀 state.json 然後生成 Persona 回覆"""
         sender_name = event.get_sender_name() if hasattr(event, "get_sender_name") else ""
         logger.info(f"[GameMonitor] 收到查遊戲指令，觸發人: {sender_name or 'unknown'}")
-        
+
         try:
             game_info = self._read_game_state()
-            
+
             if not game_info or not game_info.get("current_game"):
                 logger.info("[GameMonitor] 無遊戲記錄")
                 yield event.plain_result("📭 目前沒有遊戲記錄。請先開啟遊戲，並等待 Discord 更新狀態。")
                 return
-            
+
             game_name = game_info["current_game"]
             prompt = self._assemble_casual_prompt(game_name)
             llm_response = await self._call_llm_with_prompt(event, prompt)
-            
+
             if llm_response:
                 yield event.plain_result(llm_response)
             else:
                 yield event.plain_result(f"🎮 玩家正在進行: {game_name}")
-        
+
         except Exception as e:
             logger.error(f"[GameMonitor] 查詢失敗: {str(e)}", exc_info=True)
             yield event.plain_result(f"❌ 查詢失敗: {str(e)}")
@@ -544,20 +573,30 @@ class GameMonitorPlugin(Star):
     def _read_game_state(self) -> Optional[dict]:
         """讀取 state.json"""
         try:
-            if not os.path.exists(self.state_file):
-                default_state = self._default_state()
-                self._persist_state(default_state)
-                logger.info(f"[GameMonitor] 已建立預設 state.json: {self.state_file}")
-                return default_state
-            
-            with open(self.state_file, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
+            with self._state_file_lock:
+                if not os.path.exists(self.state_file):
+                    default_state = self._default_state()
+                    self._persist_state(default_state)
+                    logger.info(f"[GameMonitor] 已建立預設 state.json: {self.state_file}")
+                    return default_state
+
+                with open(self.state_file, encoding="utf-8") as f:
+                    loaded = json.load(f)
 
             # 向後相容：補齊舊版 state 缺少的欄位
             state = self._default_state()
             state.update(loaded)
+
+            today_iso = date_type.today().isoformat()
+            if state.get("today_date") != today_iso:
+                state["today_date"] = today_iso
+                state["warned_today"] = False
+                state["warning_count_today"] = 0
+                state["last_warning_time"] = None
+
+            self._reset_daily_runtime_flags_if_needed()
             return state
-        
+
         except Exception as e:
             logger.error(f"[GameMonitor] 讀取 state.json 失敗: {str(e)}")
             return None
@@ -565,7 +604,7 @@ class GameMonitorPlugin(Star):
     def _write_game_state(self, game_name: Optional[str], game_start_time: Optional[datetime] = None):
         """
         寫入 state.json
-        
+
         Args:
             game_name: 遊戲名稱（若為 None，表示停止遊戲）
             game_start_time: 遊戲開始時間（若為 None，表示現在開始）
@@ -574,18 +613,18 @@ class GameMonitorPlugin(Star):
             now = datetime.now()
             now_iso = now.isoformat()
             today = date_type.today()
-            
+
             existing = self._read_game_state() or self._default_state()
-            
+
             # 檢查日期是否變更，若變更則重置警告狀態
             existing_today = existing.get("today_date")
             if existing_today and existing_today != today.isoformat():
                 logger.info("[GameMonitor] 日期已變換，重置 warned_today 狀態")
                 existing["warned_today"] = False
                 existing["warning_count_today"] = 0
-            
+
             existing["today_date"] = today.isoformat()
-            
+
             if game_name:
                 # 開始遊戲
                 existing["current_game"] = game_name
@@ -605,11 +644,11 @@ class GameMonitorPlugin(Star):
             existing["last_presence_event"] = now_iso
             existing["last_bot_update"] = now_iso
             existing["bot_status_updated"] = now_iso
-            
+
             self._persist_state(existing)
-            
+
             logger.info(f"[GameMonitor] 已更新 state.json: {game_name}")
-        
+
         except Exception as e:
             logger.error(f"[GameMonitor] 寫入 state.json 失敗: {str(e)}")
 
@@ -706,16 +745,16 @@ class GameMonitorPlugin(Star):
             state = self._read_game_state()
             if not state or not state.get("game_start_time"):
                 return
-            
+
             start_time = datetime.fromisoformat(state["game_start_time"])
             duration_minutes = int((datetime.now() - start_time).total_seconds() / 60)
-            
+
             state["game_duration_minutes"] = duration_minutes
 
             self._persist_state(state)
-            
+
             logger.debug(f"[GameMonitor] 遊玩時長: {duration_minutes} 分鐘")
-        
+
         except Exception as e:
             logger.error(f"[GameMonitor] 更新遊戲時長失敗: {str(e)}")
 
@@ -725,7 +764,7 @@ class GameMonitorPlugin(Star):
 
         # 啟動時先落一筆 bot update，避免 state 長時間為 null
         self._update_state_bot_status("starting")
-        
+
         try:
             attached = await self._attach_presence_listener()
             if not attached:
@@ -776,6 +815,8 @@ class GameMonitorPlugin(Star):
 
     async def _on_presence_update(self, before, after):
         """Phase 1: 監聽 Presence 變化（掛載到 AstrBot 主 client）"""
+        self._reset_daily_runtime_flags_if_needed()
+
         try:
             target_id = self._parse_discord_id(self.target_discord_id)
             target_guild = self._parse_discord_id(self.target_guild_id)
@@ -827,7 +868,7 @@ class GameMonitorPlugin(Star):
     async def _check_game_duration(self):
         """
         Phase 2: 後台定時檢查 (每 10 分鐘)
-        
+
         - 計算當前遊玩時長
         - 若 >= 120 分鐘 && warned_today == False
         - 觸發 LLM 超時警告
@@ -835,43 +876,47 @@ class GameMonitorPlugin(Star):
         try:
             self._update_game_duration()
             state = self._read_game_state()
-            
+
             if not state or not state.get("current_game"):
                 return  # 沒有遊戲在進行
-            
+
             duration = state.get("game_duration_minutes", 0)
-            
+
             if duration >= 120 and not state.get("warned_today", False):
                 logger.warning(f"[GameMonitor] ⏰ 遊玩超過 120 分鐘: {duration} 分")
                 game_name = state["current_game"]
-                await self._trigger_llm_timeout_warning(game_name, duration)
-                
-                # 標記已警告
-                state["warned_today"] = True
-                state["last_warning_time"] = datetime.now().isoformat()
-                state["warning_count_today"] = state.get("warning_count_today", 0) + 1
+                delivered = await self._trigger_llm_timeout_warning(game_name, duration)
 
-                self._persist_state(state)
-        
+                if delivered:
+                    latest = self._read_game_state() or state
+                    latest["warned_today"] = True
+                    latest["last_warning_time"] = datetime.now().isoformat()
+                    latest["warning_count_today"] = latest.get("warning_count_today", 0) + 1
+                    self._persist_state(latest)
+                else:
+                    logger.warning("[GameMonitor] 超時提醒未成功送達，保留 warned_today=False 以便後續重試")
+
         except Exception as e:
             logger.error(f"[GameMonitor] 定時檢查失敗: {str(e)}")
 
     async def _trigger_llm_recognition(self, game_name: str, event: Optional[AstrMessageEvent] = None) -> Optional[str]:
         """
         認知建立 Prompt - 使用 Tool Calling
-        
+
         系統指令強制 Agent：
         1. 先使用聯網搜尋技能了解遊戲
         2. 再以 Persona 語氣進行回應
         """
         try:
+            self._reset_daily_runtime_flags_if_needed()
+
             strict_reason = self._get_strict_block_reason(event)
             if strict_reason:
                 logger.warning(f"[GameMonitor] strict 模式阻擋觸發: {strict_reason}")
                 return None
 
             system_instruction = self._build_recognition_prompt(game_name)
-            
+
             provider_id = ""
             if event is not None:
                 try:
@@ -939,7 +984,7 @@ class GameMonitorPlugin(Star):
 
             logger.info(f"[GameMonitor] 認知建立回覆: {llm_text}")
             return llm_text
-            
+
         except Exception as e:
             logger.error(f"[GameMonitor] 認知建立觸發失敗: {str(e)}")
             return None
@@ -1134,19 +1179,19 @@ class GameMonitorPlugin(Star):
         cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
         return cleaned.strip()
 
-    async def _send_proactive_message(self, text: str):
+    async def _send_proactive_message(self, text: str) -> bool:
         """將主動關心訊息送到指定 Discord 頻道。"""
         channel_id = self._parse_discord_id(self.target_channel_id)
         if channel_id is None:
             if self.delivery_mode == "channel_push":
                 logger.warning("[GameMonitor] delivery_mode=channel_push，但 target_channel_id 未配置。")
-                return
+                return False
             logger.info("[GameMonitor] 未配置 target_channel_id，略過主動發送關心訊息")
-            return
+            return False
 
         if self.discord_client is None:
             logger.warning("[GameMonitor] discord_client 不可用，無法主動發送關心訊息")
-            return
+            return False
 
         try:
             channel = self.discord_client.get_channel(channel_id)
@@ -1155,17 +1200,26 @@ class GameMonitorPlugin(Star):
 
             if channel is None or not hasattr(channel, "send"):
                 logger.warning(f"[GameMonitor] 無法取得可發送頻道: {channel_id}")
-                return
+                return False
 
             await channel.send(text)
             logger.info(f"[GameMonitor] 已主動發送關心訊息到頻道 {channel_id}")
+            return True
         except Exception as e:
             logger.error(f"[GameMonitor] 主動發送關心訊息失敗: {str(e)}")
+            return False
 
-    async def _trigger_llm_timeout_warning(self, game_name: str, duration_minutes: int):
+    def _should_push_timeout_warning(self) -> bool:
+        """Timeout warning has no event to reply, so reply_only means skip sending."""
+        if self.delivery_mode == "reply_only":
+            logger.info("[GameMonitor] delivery_mode=reply_only，超時提醒不做頻道推送。")
+            return False
+        return True
+
+    async def _trigger_llm_timeout_warning(self, game_name: str, duration_minutes: int) -> bool:
         """
         超時警告 Prompt - 強制提醒
-        
+
         當遊戲時長超過 120 分鐘時觸發
         """
         try:
@@ -1176,13 +1230,39 @@ class GameMonitorPlugin(Star):
 - 可以傲嬌地吃醋「早點玩完陪我」
 - 可以溫柔地表示擔心
 - 保持簡潔，一句話即可"""
-            
-            logger.warning(f"[GameMonitor] 超時警告 Prompt:\n{warning_prompt}")
-            
-            # TODO: 透過 context.llm_generate 或 Agent Tool Calling 發送此 Prompt
-            
+
+            using_provider = self.context.get_using_provider()
+            provider_id = ""
+            if using_provider is not None:
+                provider_id = using_provider.meta().id
+
+            if not provider_id:
+                logger.warning("[GameMonitor] 超時提醒失敗：找不到可用聊天模型 provider")
+                return False
+
+            llm_resp = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=warning_prompt,
+            )
+            llm_text = (getattr(llm_resp, "completion_text", "") or "").strip()
+            llm_text = self._strip_tool_artifacts(llm_text)
+            if not llm_text:
+                logger.warning("[GameMonitor] 超時提醒生成失敗：LLM 回覆為空")
+                return False
+
+            if not self._should_push_timeout_warning():
+                return False
+
+            sent = await self._send_proactive_message(llm_text)
+            if not sent:
+                logger.warning("[GameMonitor] 超時提醒生成成功，但頻道投遞失敗")
+                return False
+
+            logger.warning(f"[GameMonitor] 已送出超時提醒: {llm_text}")
+            return True
         except Exception as e:
             logger.error(f"[GameMonitor] 超時警告觸發失敗: {str(e)}")
+            return False
 
     def _assemble_casual_prompt(self, game_name: str) -> str:
         """被動查詢時的 Casual Prompt"""
@@ -1198,21 +1278,21 @@ class GameMonitorPlugin(Star):
         try:
             umo = event.unified_msg_origin
             provider_id = await self.context.get_current_chat_provider_id(umo=umo)
-            
+
             if not provider_id:
                 logger.warning("[GameMonitor] 無法獲取當前聊天模型 ID")
                 return None
-            
+
             llm_resp = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
             )
-            
+
             if not llm_resp:
                 return None
-            
+
             return llm_resp.completion_text
-        
+
         except Exception as e:
             logger.error(f"[GameMonitor] LLM 調用失敗: {str(e)}")
             return None
@@ -1220,6 +1300,7 @@ class GameMonitorPlugin(Star):
     def _update_state_bot_status(self, status: str):
         """更新 bot_status"""
         try:
+            self._reset_daily_runtime_flags_if_needed()
             state = self._read_game_state() or self._default_state()
             state["bot_status"] = status
             state["bot_status_updated"] = self._now_iso()
